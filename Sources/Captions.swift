@@ -29,7 +29,6 @@ final class MicrophoneLight {
     private(set) var listening = false
     private var dragged = false
     private let positionKey = "microphoneLightPinnedOrigin"
-    private var lastCaret: (spot: FocusFollowing.Spot, origin: CGPoint)?
     private var pinned: NSPoint?
 
     init() {
@@ -93,15 +92,8 @@ final class MicrophoneLight {
         let origin: NSPoint?
         if let pinned, let screen = NSScreen.screens.first(where:{$0.frame.contains(pinned)}) {
             origin = IndicatorPlacement.clamp(pinned,to:screen.visibleFrame)
-        } else if let spot, let point = IndicatorPlacement.origin(for: spot) {
-            lastCaret = (spot, point)
-            origin = point
-        } else if let lastCaret, let spot, spot.field != nil, spot == lastCaret.spot,
-                  NSScreen.screens.contains(where: { $0.visibleFrame.contains(lastCaret.origin) }) {
-            origin = lastCaret.origin
         } else {
-            lastCaret = nil
-            origin = nil
+            origin = IndicatorPlacement.origin(for: spot)
         }
         guard let origin else {
             fade.hide()
@@ -159,7 +151,6 @@ final class MicrophoneLight {
     func hide() {
         cancelSpeechTimers()
         listening = false
-        lastCaret = nil
         speaking = false
         drag = nil
         fade.hide()

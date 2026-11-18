@@ -1,103 +1,88 @@
-import AppKit
-import CoreText
+import ApplicationServices
+import Foundation
 
-/// Some web editors expose the rendered text runs and selection, but return zero-sized glyph bounds.
+/// A web editor may anchor a collapsed selection on a paragraph instead of its text leaf.
 enum RenderedCaret {
-    private struct Run {
-        let text: String
-        let ink: CGRect
-        let paragraph: CGRect
-    }
+    // An empty paragraph can reserve several rows even when its placeholder paints just one.
+    static func emptyLineBottom(in field: AXUIElement, selection: AXTextMarkerRange, row: CGRect) -> CGFloat? {
+        let query = IndicatorPlacement.parameter
+        let end = AXTextMarkerRangeCopyEndMarker(selection)
+        guard let rawOwner = query(field, "AXUIElementForTextMarker", end),
+              CFGetTypeID(rawOwner) == AXUIElementGetTypeID() else { return nil }
+        let search: [String: Any] = ["AXSearchKey": "AXAnyTypeSearchKey", "AXDirection": "AXDirectionNext", "AXResultsLimit": 8]
+        guard let nodes = query(rawOwner as! AXUIElement, "AXUIElementsForSearchPredicate", search as CFDictionary) as? [AXUIElement] else { return nil }
 
-    static func bounds(in field: AXUIElement, index: Int) -> CGRect? {
-        let attr = IndicatorPlacement.attribute
-        guard let box = IndicatorPlacement.frame(of: field),
-              let value = attr(field, kAXValueAttribute) as? String, value.utf16.count <= 16384 else { return nil }
-        let content = value as NSString
-        guard index >= 0, index <= content.length else { return nil }
-        var runs: [Run] = []
-        var remaining = 256
-        func collect(_ node: AXUIElement, parent: CGRect) {
-            remaining -= 1
-            guard remaining >= 0 else { return }
-            let frame = IndicatorPlacement.frame(of: node) ?? parent
-            if attr(node, kAXRoleAttribute) as? String == "AXStaticText" {
-                if let text = attr(node, kAXValueAttribute) as? String, !text.isEmpty,
-                   box.insetBy(dx: -2, dy: -2).intersects(frame) {
-                    runs.append(Run(text: text, ink: frame, paragraph: parent))
+        let area = row.insetBy(dx: -1, dy: -1)
+        var hint: CGRect?, hintNode: AXUIElement?, lineBreak: CGRect?
+        for node in nodes {
+            let frame = IndicatorPlacement.frame(of: node, allowingZeroWidth: true)
+            if let frame, frame.width > 0 {
+                if area.contains(frame), IndicatorPlacement.attribute(node, kAXRoleAttribute) as? String == "AXStaticText" {
+                    if hintNode == nil { hintNode = node }
+                    hint = hint.map { $0.union(frame) } ?? frame
                 }
-            } else if let children = attr(node, kAXChildrenAttribute) as? [AXUIElement] {
-                for child in children where remaining > 0 { collect(child, parent: frame) }
+            } else if let rawRun = query(field, "AXTextMarkerRangeForUIElement", node),
+                      CFGetTypeID(rawRun) == AXTextMarkerRangeGetTypeID(),
+                      query(field, "AXStringForTextMarkerRange", rawRun) as? String == "\n" {
+                let start = AXTextMarkerRangeCopyStartMarker(rawRun as! AXTextMarkerRange)
+                guard let span = query(field, "AXTextMarkerRangeForUnorderedTextMarkers", [start, end] as CFArray),
+                      query(field, "AXStringForTextMarkerRange", span) as? String == "" else { continue }
+                let measured = IndicatorPlacement.rect(query(field, "AXBoundsForTextMarkerRange", rawRun))
+                lineBreak = measured.flatMap { $0.width <= 2 ? $0 : nil } ?? frame
             }
         }
-        collect(field, parent: box)
-        if let marker = attr(field, "AXSelectedTextMarkerRange"), CFGetTypeID(marker) == AXTextMarkerRangeGetTypeID() {
-            let end = AXTextMarkerRangeCopyEndMarker(marker as! AXTextMarkerRange)
-            if let edge = lineEnd(in: field, at: end, inside: box) { return edge }
-        }
-        var offset = 0
-        for run in runs {
-            let match = content.range(of: run.text, options: .literal, range: NSRange(location: offset, length: content.length - offset))
-            guard match.location != NSNotFound else { continue }
-            if (match.location...NSMaxRange(match)).contains(index) {
-                return caret(in: run, at: index - match.location)
+
+        if let hint, let hintNode {
+            var lineHeight = lineBreak?.height
+            if lineHeight == nil, let range = query(field, "AXTextMarkerRangeForUIElement", hintNode),
+               CFGetTypeID(range) == AXTextMarkerRangeGetTypeID() {
+                let start = AXTextMarkerRangeCopyStartMarker(range as! AXTextMarkerRange)
+                let point = AXTextMarkerRangeCreate(nil, start, start)
+                if let glyph = IndicatorPlacement.rect(query(field, "AXBoundsForTextMarkerRange", point)), glyph.width <= 2 {
+                    lineHeight = glyph.height
+                }
             }
-            offset = NSMaxRange(match)
+            if let lineHeight, hint.height > lineHeight + 1 { return nil }
+            return hint.maxY
         }
-        return nil
+        guard let lineBreak, lineBreak.minY >= area.minY, lineBreak.maxY <= area.maxY else { return nil }
+        return lineBreak.maxY
     }
 
-    private static func lineEnd(in field: AXUIElement, at marker: AXTextMarker, inside fieldBox: CGRect) -> CGRect? {
+    static func bounds(in field: AXUIElement, selection: AXTextMarkerRange) -> CGRect? {
         func query(_ key: String, _ input: CFTypeRef) -> CFTypeRef? {
-            var out: CFTypeRef?
-            guard AXUIElementCopyParameterizedAttributeValue(field, key as CFString, input, &out) == .success else { return nil }
-            return out
+            var value: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(field, key as CFString, input, &value) == .success else { return nil }
+            return value
         }
-        guard let leaf = query("AXUIElementForTextMarker", marker),
-              CFGetTypeID(leaf) == AXUIElementGetTypeID(),
-              IndicatorPlacement.attribute(leaf as! AXUIElement, kAXRoleAttribute) as? String == "AXStaticText",
-              let row = query("AXLineTextMarkerRangeForTextMarker", marker), CFGetTypeID(row) == AXTextMarkerRangeGetTypeID()
-        else { return nil }
-        let start = AXTextMarkerRangeCopyStartMarker(row as! AXTextMarkerRange)
-        let prefix = AXTextMarkerRangeCreate(nil, start, marker)
-        guard let raw = query("AXBoundsForTextMarkerRange", prefix), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
-        var bounds = CGRect.zero
-        guard AXValueGetValue(raw as! AXValue, .cgRect, &bounds), bounds.height > 0, bounds.height < 100,
-              fieldBox.insetBy(dx: -2, dy: -2).contains(bounds) else { return nil }
-        return CGRect(x: bounds.maxX, y: bounds.minY, width: 0, height: bounds.height)
-    }
 
-    private static func caret(in run: Run, at offset: Int) -> CGRect? {
-        let box = run.ink
-        let paragraph = run.paragraph
-        guard box.width > 0, paragraph.width > 0 else { return nil }
-        // Web line boxes often include equal leading above and below the first/last glyphs.
-        let leading = max(0, box.minY - paragraph.minY)
-        let defaultSize = NSFont.systemFontSize
-        let nominalHeight = defaultSize * 1.25 + leading * 2
-        let count = max(1, Int((paragraph.height / nominalHeight).rounded()))
-        let lineHeight = paragraph.height / CGFloat(count)
-        guard lineHeight >= 8, lineHeight < 100 else { return nil }
-        let em = max(7, (lineHeight - 2 * leading) * 0.875)
-        let font = NSFont.systemFont(ofSize: em)
-        let string = NSAttributedString(string: run.text, attributes: [.font: font])
-        let typesetter = CTTypesetterCreateWithAttributedString(string)
-        var start = 0
-        for row in 0..<count where start < string.length {
-            let length = row == count - 1 ? string.length - start :
-                CTTypesetterSuggestLineBreak(typesetter, start, Double(paragraph.width))
-            guard length > 0 else { return nil }
-            let end = start + length
-            if offset < end || end == string.length && offset == end {
-                let line = CTTypesetterCreateLine(typesetter, CFRange(location: start, length: length))
-                let advance = CGFloat(CTLineGetOffsetForStringIndex(line, offset, nil))
-                let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
-                let x = count == 1 && width > 0 ? box.minX + advance * box.width / width : paragraph.minX + advance
-                return CGRect(x: min(max(x, paragraph.minX), paragraph.maxX),
-                              y: paragraph.minY + CGFloat(row) * lineHeight, width: 0, height: lineHeight)
+        let end = AXTextMarkerRangeCopyEndMarker(selection)
+        guard let node = query("AXUIElementForTextMarker", end), CFGetTypeID(node) == AXUIElementGetTypeID(),
+              let fieldBox = IndicatorPlacement.frame(of: field) else { return nil }
+        var remaining = 256
+        func matchingEdge(in node: AXUIElement) -> CGRect? {
+            guard remaining > 0 else { return nil }
+            remaining -= 1
+            if IndicatorPlacement.attribute(node, kAXRoleAttribute) as? String == "AXStaticText" {
+                guard let raw = query("AXTextMarkerRangeForUIElement", node),
+                      CFGetTypeID(raw) == AXTextMarkerRangeGetTypeID() else { return nil }
+                let run = raw as! AXTextMarkerRange
+                for marker in [AXTextMarkerRangeCopyEndMarker(run), AXTextMarkerRangeCopyStartMarker(run)] {
+                    guard let span = query("AXTextMarkerRangeForUnorderedTextMarkers", [marker, end] as CFArray),
+                          query("AXStringForTextMarkerRange", span) as? String == "" else { continue }
+                    let collapsed = AXTextMarkerRangeCreate(nil, marker, marker)
+                    if let box = IndicatorPlacement.rect(query("AXBoundsForTextMarkerRange", collapsed)),
+                       box.width <= 2, fieldBox.insetBy(dx: -2, dy: -2).contains(CGPoint(x: box.midX, y: box.midY)) {
+                        return box
+                    }
+                }
+            } else if let children = IndicatorPlacement.attribute(node, kAXChildrenAttribute) as? [AXUIElement] {
+                for child in children.reversed() where remaining > 0 {
+                    if let edge = matchingEdge(in: child) { return edge }
+                }
             }
-            start = end
+            return nil
         }
-        return nil
+        return matchingEdge(in: node as! AXUIElement)
     }
 }

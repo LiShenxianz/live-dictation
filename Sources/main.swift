@@ -28,6 +28,10 @@ final class DictationApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var shortcutEditor: ShortcutEditor?
     private var hotkeysAvailable = false
     private let settings = NSMenuItem(title: "自定义快捷键…", action: #selector(changeShortcut), keyEquivalent: "")
+    private lazy var microphones = MicrophoneMenu { [weak self] device in
+        guard let self, !self.busy, let live = self.live, live.isRecording else { return }
+        try live.changeMicrophone(to: device)
+    }
     private let access = NSMenuItem()
     private var status = "听写"
     private let light = MicrophoneLight()
@@ -62,6 +66,7 @@ final class DictationApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.setAccessibilityLabel("神仙语音转录")
         action.target = self
         menu.addItem(action)
+        menu.addItem(microphones.item)
         menu.addItem(.separator())
         settings.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
         settings.target = self
@@ -119,6 +124,7 @@ final class DictationApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        microphones.refreshTitle(recordingDeviceName: live?.isRecording == true ? live?.name : nil)
         refreshAccess()
     }
 
@@ -136,7 +142,7 @@ final class DictationApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             switch AVCaptureDevice.authorizationStatus(for: .audio) {
             case .authorized:
-                subtitle = "就绪"
+                subtitle = microphones.captureDevice() == nil ? "麦克风未连接" : "就绪"
             case .notDetermined: subtitle = "首次开麦时需授权"
             default: subtitle = "麦克风未授权"
             }
@@ -281,7 +287,10 @@ final class DictationApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         do {
             live = session
-            try session.start(node: nodeURL, script: Bundle.main.url(forResource: "transcribe", withExtension: "cjs")!)
+            guard let mic = microphones.captureDevice() else {
+                throw NSError(domain: "LiveInput", code: 1, userInfo: [NSLocalizedDescriptionKey: microphones.unavailableMessage])
+            }
+            try session.start(microphone: mic, node: nodeURL, script: Bundle.main.url(forResource: "transcribe", withExtension: "cjs")!)
             guard session.isRecording else { return }
             cues.begin()
             setStatus("● 录音中")

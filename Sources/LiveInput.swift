@@ -30,12 +30,24 @@ final class LiveInput: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         onEnd = end
     }
 
-    func start(node: URL, script: URL) throws {
-        guard let mic = AVCaptureDevice.default(for: .audio) else { throw Self.error("找不到默认麦克风，请检查系统声音输入。") }
-        name = mic.localizedName
-        let device = try AVCaptureDeviceInput(device: mic)
-        guard capture.canAddInput(device) else { throw Self.error("无法打开" + name) }
-        capture.addInput(device)
+    func changeMicrophone(to microphone: AVCaptureDevice?) throws {
+        guard let microphone else { throw Self.error("找不到可用的麦克风。") }
+        let previous = capture.inputs.first as? AVCaptureDeviceInput
+        if previous?.device.uniqueID == microphone.uniqueID { return }
+        let next = try AVCaptureDeviceInput(device: microphone)
+        capture.beginConfiguration()
+        defer { capture.commitConfiguration() }
+        if let previous { capture.removeInput(previous) }
+        guard capture.canAddInput(next) else {
+            if let previous, capture.canAddInput(previous) { capture.addInput(previous) }
+            throw Self.error("无法打开" + microphone.localizedName)
+        }
+        capture.addInput(next)
+        name = microphone.localizedName
+    }
+
+    func start(microphone: AVCaptureDevice, node: URL, script: URL) throws {
+        try changeMicrophone(to: microphone)
         output.audioSettings = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000,
             AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]

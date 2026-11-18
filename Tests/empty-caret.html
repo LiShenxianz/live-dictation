@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Empty editor caret geometry</title>
+<style>
+  body { margin: 40px; font: 16px/24px system-ui; }
+  #editor { padding: 12px; width: 290px; }
+  p { margin: 0; white-space: pre-wrap; }
+  p[data-hint]::before { content: attr(data-hint); float: left; height: 0; pointer-events: none; }
+  #reference { position: fixed; border: 0; padding: 0; width: 2px; height: 2px; opacity: .02; }
+</style>
+<div id="editor" contenteditable="true" role="textbox" aria-multiline="true"><p><br></p></div>
+<button id="reference" aria-label="Caret reference" tabindex="-1"></button>
+<script>
+  const paragraph = editor.firstElementChild;
+  const layout = [
+    {name: 'single-line hint in a two-line editor', hint: '和 Codex 一起工作', height: '2lh', singleLine: true},
+    {name: 'wrapped hint', hint: '文字很长也应该对齐第一行的光标。'.repeat(5), height: '5lh'},
+    {name: 'moved editor', move: true},
+    {name: 'right aligned', align: 'right'},
+    {name: 'empty paragraph', hint: '', height: '3lh', align: 'left', singleLine: true},
+    {name: 'after another paragraph', preceding: true},
+    {name: 'trailing break endpoint', end: true}
+  ];
+  let index = 0;
+  function render() {
+    const step = layout[index];
+    if (index === 0) {
+      for (const node of [...editor.children]) if (node !== paragraph) node.remove();
+      editor.style.marginLeft = '';
+      paragraph.style.textAlign = 'left';
+    }
+    if (step.hint !== undefined) {
+      if (step.hint) paragraph.dataset.hint = step.hint;
+      else delete paragraph.dataset.hint;
+    }
+    if (step.height) paragraph.style.minHeight = step.height;
+    if (step.move) editor.style.marginLeft = '70px';
+    if (step.align) paragraph.style.textAlign = step.align;
+    if (step.preceding) {
+      const text = document.createElement('p');
+      text.textContent = '这一段已经有文字。';
+      editor.prepend(text);
+    }
+    editor.focus();
+    getSelection().collapse(paragraph, step.end ? paragraph.childNodes.length : 0);
+    const block = paragraph.getBoundingClientRect();
+    const line = paragraph.querySelector('br').getBoundingClientRect();
+    const trailing = step.preceding || step.end;
+    reference.style.left = (trailing ? line.left : block.left) + 'px';
+    reference.style.top = (step.singleLine || trailing ? line.bottom : block.bottom) + 'px';
+    reference.setAttribute('aria-label', 'Caret reference ' + index + ' ' + step.name);
+  }
+  render();
+  // Run inside this disposable test page without sending keyboard events to the desktop.
+  setInterval(() => { index = (index + 1) % layout.length; render(); }, 800);
+</script>

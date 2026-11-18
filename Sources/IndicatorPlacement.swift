@@ -16,7 +16,7 @@ enum IndicatorPlacement {
         return value
     }
 
-    private static func parameter(_ field: AXUIElement, _ name: String, _ arg: CFTypeRef) -> CFTypeRef? {
+    static func parameter(_ field: AXUIElement, _ name: String, _ arg: CFTypeRef) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(field, name as CFString, arg, &value) == .success else { return nil }
         return value
@@ -29,7 +29,7 @@ enum IndicatorPlacement {
         return result
     }
 
-    private static func rect(_ value: CFTypeRef?) -> CGRect? {
+    static func rect(_ value: CFTypeRef?) -> CGRect? {
         var result = CGRect.zero
         guard let value, CFGetTypeID(value) == AXValueGetTypeID(),
               AXValueGetValue(value as! AXValue, .cgRect, &result),
@@ -44,15 +44,43 @@ enum IndicatorPlacement {
         return rect(parameter(field, kAXBoundsForRangeParameterizedAttribute, arg))
     }
 
-    private static func markerBounds(_ field: AXUIElement) -> CGRect? {
+    private static func selectedMarkers(in field: AXUIElement) -> AXTextMarkerRange? {
         guard let value = attribute(field, "AXSelectedTextMarkerRange"),
               CFGetTypeID(value) == AXTextMarkerRangeGetTypeID() else { return nil }
-        let end = AXTextMarkerRangeCopyEndMarker(value as! AXTextMarkerRange)
-        let insertion = AXTextMarkerRangeCreate(kCFAllocatorDefault, end, end)
-        return rect(parameter(field, "AXBoundsForTextMarkerRange", insertion))
+        return (value as! AXTextMarkerRange)
     }
 
-    private static func emptyLine(_ row: CGRect, in field: AXUIElement, at index: Int) -> CGRect? {
+    private static func markerBounds(in field: AXUIElement, selection: AXTextMarkerRange) -> CGRect? {
+        let end = AXTextMarkerRangeCopyEndMarker(selection)
+        let insertion = AXTextMarkerRangeCreate(kCFAllocatorDefault, end, end)
+        guard let box = rect(parameter(field, "AXBoundsForTextMarkerRange", insertion)) else { return nil }
+        if box.width <= 5, let edge = softWrapEnd(in: field, at: end, reported: box) { return edge }
+        return box
+    }
+
+    /// Chromium can return the next line's origin for both affinities of a soft wrap.
+    private static func softWrapEnd(in field: AXUIElement, at end: AXTextMarker, reported: CGRect) -> CGRect? {
+        guard let previous = parameter(field, "AXPreviousTextMarkerForTextMarker", end),
+              CFGetTypeID(previous) == AXTextMarkerGetTypeID() else { return nil }
+        let start = previous as! AXTextMarker
+        let character = AXTextMarkerRangeCreate(nil, start, end)
+        guard let glyph = rect(parameter(field, "AXBoundsForTextMarkerRange", character)),
+              glyph.width > 0, glyph.maxY <= reported.minY + 1,
+              let remainder = parameter(field, "AXRightLineTextMarkerRangeForTextMarker", end),
+              (parameter(field, "AXLengthForTextMarkerRange", remainder) as? NSNumber)?.intValue == 0,
+              let text = parameter(field, "AXStringForTextMarkerRange", character) as? String,
+              text.count == 1, text.rangeOfCharacter(from: .newlines) == nil else { return nil }
+        let before = AXTextMarkerRangeCreate(nil, start, start)
+        guard let leading = rect(parameter(field, "AXBoundsForTextMarkerRange", before)),
+              leading.width <= 5, abs(leading.midY - glyph.midY) <= 2 else { return nil }
+        let x: CGFloat
+        if abs(leading.minX - glyph.minX) <= 1 { x = glyph.maxX }
+        else if abs(leading.minX - glyph.maxX) <= 1 { x = glyph.minX }
+        else { return nil }
+        return CGRect(x: x, y: glyph.minY, width: 0, height: glyph.height)
+    }
+
+    private static func emptyLine(_ row: CGRect, in field: AXUIElement, at index: Int, selection: AXTextMarkerRange) -> CGRect? {
         // Chromium exposes an empty paragraph as a whole line, including CSS placeholder text.
         for x in [row.minX + 1, row.maxX - 1] {
             var point = CGPoint(x: x, y: row.midY)
@@ -60,15 +88,17 @@ enum IndicatorPlacement {
                   let hit = range(parameter(field, kAXRangeForPositionParameterizedAttribute, arg)),
                   hit.length == 0, hit.location == index else { return nil }
         }
-        return CGRect(x: row.minX, y: row.minY, width: 0, height: row.height)
+        let bottom = RenderedCaret.emptyLineBottom(in: field, selection: selection, row: row) ?? row.maxY
+        return CGRect(x: row.minX, y: row.minY, width: 0, height: bottom - row.minY)
     }
 
-    static func frame(of element: AXUIElement) -> CGRect? {
+    static func frame(of element: AXUIElement, allowingZeroWidth: Bool = false) -> CGRect? {
         var p = CGPoint.zero, size = CGSize.zero
         guard let position = attribute(element, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
               let extent = attribute(element, kAXSizeAttribute), CFGetTypeID(extent) == AXValueGetTypeID(),
               AXValueGetValue(position as! AXValue, .cgPoint, &p), AXValueGetValue(extent as! AXValue, .cgSize, &size),
-              size.width > 0, size.height > 0 else { return nil }
+              p.x.isFinite, p.y.isFinite, size.width.isFinite, size.height.isFinite, size.height > 0,
+              size.width > 0 || (allowingZeroWidth && size.width == 0) else { return nil }
         return CGRect(origin: p, size: size)
     }
 
@@ -97,14 +127,17 @@ enum IndicatorPlacement {
     }
 
     private static func caret(in field: AXUIElement) -> CGRect? {
-        let marker = markerBounds(field)
+        let markers = selectedMarkers(in: field)
+        let marker = markers.flatMap { markerBounds(in: field, selection: $0) }
         if let marker, marker.width <= 5 { return marker }
         guard let selected = range(attribute(field, kAXSelectedTextRangeAttribute)) else { return nil }
         let index = selected.location + selected.length
-        let previous = index > 0 ? textBounds(field, at: index - 1, length: 1) : nil
+        func previousGlyph() -> CGRect? {
+            index > 0 ? textBounds(field, at: index - 1, length: 1) : nil
+        }
         if var direct = textBounds(field, at: index, length: 0), direct.width <= 5 {
             // NSTextView sometimes reports the collapsed range exactly one row too high.
-            if let previous, abs(previous.maxX - direct.minX) < 4, abs(previous.minY - direct.maxY) < 2 {
+            if let previous = previousGlyph(), abs(previous.maxX - direct.minX) < 4, abs(previous.minY - direct.maxY) < 2 {
                 func line(_ i: Int) -> Int? {
                     (parameter(field, kAXLineForIndexParameterizedAttribute, NSNumber(value: i)) as? NSNumber)?.intValue
                 }
@@ -122,25 +155,34 @@ enum IndicatorPlacement {
             return CGRect(x: next.minX, y: next.minY, width: 0, height: next.height)
         }
         if count == 0, index == 0, marker == nil, let empty = emptyInsertion(in: field) { return empty }
-        if let previous { return CGRect(x: previous.maxX, y: previous.minY, width: 0, height: previous.height) }
-        if let layout = RenderedCaret.bounds(in: field, index: index) { return layout }
-        if let marker, selected.length == 0 { return emptyLine(marker, in: field, at: index) }
+        if let previous = previousGlyph() { return CGRect(x: previous.maxX, y: previous.minY, width: 0, height: previous.height) }
+        if let marker, let markers, selected.length == 0 {
+            let text = attribute(field, kAXValueAttribute) as? NSString
+            let startsLine = index == 0 || (text.map { index <= $0.length && $0.character(at: index - 1) == 10 } ?? false)
+            if startsLine, let empty = emptyLine(marker, in: field, at: index, selection: markers) { return empty }
+        }
+        if let markers, let exact = RenderedCaret.bounds(in: field, selection: markers) { return exact }
         return nil
     }
 
     static func origin(for spot: FocusFollowing.Spot?) -> CGPoint? {
         guard let spot else { return nil }
+        func narrowMarker(in node: AXUIElement) -> CGRect? {
+            guard let markers = selectedMarkers(in: node), let box = markerBounds(in: node, selection: markers),
+                  box.width <= 5 else { return nil }
+            return box
+        }
         func documentCaret() -> CGRect? {
             var node = spot.field.flatMap { FocusFollowing.Spot.element($0, kAXParentAttribute) }
             for _ in 0..<32 {
                 guard let current = node, current != spot.window else { break }
                 if attribute(current, kAXRoleAttribute) as? String == "AXWebArea" {
-                    if let bounds = markerBounds(current), bounds.width <= 5 { return bounds }
+                    if let bounds = narrowMarker(in: current) { return bounds }
                     break
                 }
                 node = FocusFollowing.Spot.element(current, kAXParentAttribute)
             }
-            return spot.window.flatMap(markerBounds).flatMap { $0.width <= 5 ? $0 : nil }
+            return spot.window.flatMap(narrowMarker)
         }
         func editorUnderPointer() -> CGRect? {
             guard spot.opaque, FocusFollowing.Spot.textPointer(), let window = spot.window,

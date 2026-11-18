@@ -23,10 +23,16 @@ final class FocusFollowing {
             guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
             let a = AXUIElementCreateApplication(front.processIdentifier)
             var field = element(a, kAXFocusedUIElementAttribute)
-            if accessibilityPID != front.processIdentifier || (field == nil && Date().timeIntervalSince(lastAccessibilityAttempt) >= 1) {
+            if accessibilityPID != front.processIdentifier || (field == nil && Date().timeIntervalSince(lastAccessibilityAttempt) >= 3) {
                 lastAccessibilityAttempt = Date()
                 accessibilityPID = front.processIdentifier
-                _ = AXUIElementSetAttributeValue(a, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+                let manual = AXUIElementSetAttributeValue(a, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+                if manual == .attributeUnsupported, let url = front.bundleURL,
+                   let principal = Bundle(url: url)?.object(forInfoDictionaryKey: "NSPrincipalClass") as? String,
+                   principal.hasSuffix("CrApplication") {
+                    // Chromium enables inline glyph geometry asynchronously after this request.
+                    _ = AXUIElementSetAttributeValue(a, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+                }
                 field = element(a, kAXFocusedUIElementAttribute)
             }
             if field == nil, let focused = element(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute) {
@@ -40,13 +46,13 @@ final class FocusFollowing {
             var role: CFTypeRef?, subrole: CFTypeRef?, selection: CFTypeRef?
             _ = AXUIElementCopyAttributeValue(field,kAXRoleAttribute as CFString,&role)
             _ = AXUIElementCopyAttributeValue(field,kAXSubroleAttribute as CFString,&subrole)
-            guard subrole as? String != "AXSecureTextField" else { return false }
             let roleName = role as? String ?? ""
-            let hasSelection = AXUIElementCopyAttributeValue(field,kAXSelectedTextRangeAttribute as CFString,&selection) == .success
+            guard subrole as? String != "AXSecureTextField",
+                  ["AXTextArea","AXTextField","AXComboBox","AXSearchField"].contains(roleName) else { return false }
+            if AXUIElementCopyAttributeValue(field,kAXSelectedTextRangeAttribute as CFString,&selection) == .success { return true }
             var writable = DarwinBoolean(false)
             _ = AXUIElementIsAttributeSettable(field,kAXValueAttribute as CFString,&writable)
-            return ["AXTextArea","AXTextField","AXComboBox","AXSearchField"].contains(roleName)
-                && (hasSelection || writable.boolValue)
+            return writable.boolValue
         }
         static func textPointer() -> Bool {
             guard let cursor = NSCursor.currentSystem else { return false }
