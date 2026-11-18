@@ -113,7 +113,7 @@ final class TextDestination {
         var message: String? {
             switch self {
             case .inserted, .pasteSent: return nil
-            case .needsAccess: return "已复制。请在「辅助功能」中开启X-ASR 听写。"
+            case .needsAccess: return "已复制。请在「辅助功能」中开启神仙语音转录。"
             case .focusChanged: return "输入焦点已改变，文字已复制，可按 ⌘V。"
             case .unavailable: return "无法自动输入，文字已复制，可按 ⌘V。"
             }

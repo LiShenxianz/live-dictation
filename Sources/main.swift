@@ -20,7 +20,8 @@ func transcribe(_ url: URL) throws -> String {
 }
 
 final class DictationApp: NSObject, NSApplicationDelegate {
-    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let brand = NSMenuItem(title: "神仙语音转录", action: nil, keyEquivalent: "")
     let action = NSMenuItem(title: "开始听写（⌃⌥D）", action: #selector(toggle), keyEquivalent: "")
     let info = NSMenuItem(title: "X-ASR · 本机识别", action: nil, keyEquivalent: "")
     var hotkey: EventHotKeyRef?
@@ -36,6 +37,14 @@ final class DictationApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
+        menu.addItem(brand)
+        menu.addItem(.separator())
+        item.autosaveName = "LiveDictation"
+        item.isVisible = true
+        let image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "神仙语音转录")
+        image?.isTemplate = true
+        item.button?.image = image
+        item.button?.setAccessibilityLabel("神仙语音转录")
         action.target = self
         menu.addItem(action)
         menu.addItem(info)
@@ -43,8 +52,8 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "授权自动输入…", action: #selector(requestPasteAccess), keyEquivalent: "").target = self
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         item.menu = menu
-        item.button?.title = "听写"
-        item.button?.toolTip = "X-ASR 听写 · Control + Option + D"
+        setStatus("听写")
+        item.button?.toolTip = "神仙语音转录 · Control + Option + D"
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let installed = InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
             guard let context else { return OSStatus(eventNotHandledErr) }
@@ -57,7 +66,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         let microphoneRegistered = RegisterEventHotKey(UInt32(kVK_F20), 0, microphoneID, GetApplicationEventTarget(), 0, &microphoneHotkey)
         if installed == noErr && microphoneRegistered == noErr && microphoneKey.install() {
             shortcutTitle = "开始听写（麦克风键）"
-            item.button?.toolTip = "按一次麦克风键开始，再按一次结束"
+            item.button?.toolTip = "神仙语音转录 · 按麦克风键开始或结束"
         } else {
             if let microphoneHotkey { UnregisterEventHotKey(microphoneHotkey) }
             if installed == noErr && registered == noErr {
@@ -74,6 +83,17 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func setStatus(_ status: String) {
+        brand.title = status == "听写" ? "神仙语音转录" : "神仙语音转录 · " + status
+        item.button?.toolTip = brand.title
+        item.button?.setAccessibilityValue(status)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        item.menu?.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        return false
+    }
+
     @objc func requestPasteAccess() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
@@ -81,7 +101,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
 
     func alert(_ message: String) {
         let box = NSAlert()
-        box.messageText = "X-ASR 听写"
+        box.messageText = "神仙语音转录"
         box.informativeText = message
         box.runModal()
     }
@@ -92,7 +112,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
             following?.stop()
             following = nil
             if live == nil {
-                item.button?.title = "听写"
+                setStatus("听写")
                 action.title = shortcutTitle
                 light.hide()
                 return
@@ -100,7 +120,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         }
         if let live {
             busy = true
-            item.button?.title = "正在完成…"
+            setStatus("正在完成…")
             light.hide()
             live.finish()
             return
@@ -111,7 +131,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
                 self.busy = false
                 guard granted else {
                     self.light.hide()
-                    self.alert("请到「隐私与安全性 → 麦克风」允许X-ASR 听写。")
+                    self.alert("请到「隐私与安全性 → 麦克风」允许神仙语音转录。")
                     return
                 }
                 self.following = FocusFollowing(pause: { [weak self] in self?.pauseForFocus() },
@@ -132,7 +152,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         let old = live
         live = nil
         old?.finish()
-        item.button?.title = "等待输入框"
+        setStatus("等待输入框")
     }
 
     private func resumeAtFocus() {
@@ -153,7 +173,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         }, level: { [weak self] audible in
             guard let self, self.generation == current, !self.busy, self.live != nil else { return }
             self.light.signal(audible)
-            self.item.button?.title = audible ? "🟢 听写中" : "● 录音中"
+            self.setStatus(audible ? "🟢 听写中" : "● 录音中")
         }, end: { [weak self] result in
             guard let self, self.generation == current else { return }
             self.following?.stop()
@@ -162,7 +182,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
             self.live = nil
             self.busy = false
             self.action.title = self.shortcutTitle
-            self.item.button?.title = "听写"
+            self.setStatus("听写")
             switch result {
             case .success(let text) where text.isEmpty:
                 self.destination?.update("")
@@ -170,7 +190,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
             case .success(let text):
                 let outcome = self.destination?.insert(text) ?? .unavailable
                 if let message = outcome.message {
-                    self.item.button?.title = "已复制 · ⌘V"
+                    self.setStatus("已复制 · ⌘V")
                     self.info.title = message
                     if outcome == .needsAccess { self.requestPasteAccess() }
                     return
@@ -182,7 +202,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         do {
             live = session
             try session.start(node: nodeURL, script: Bundle.main.url(forResource: "transcribe", withExtension: "cjs")!)
-            item.button?.title = "● 录音中"
+            setStatus("● 录音中")
             action.title = "结束并输入文字"
         } catch {
             following?.stop()
