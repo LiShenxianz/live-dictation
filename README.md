@@ -1,4 +1,4 @@
-# X-ASR 听写
+# Live Dictation
 
 macOS 菜单栏听写工具。按一次麦克风键开始说话，识别文字直接出现在当前输入框，再按一次结束。安装包内置中英双语 X-ASR 流式模型和推理引擎，音频在本机处理，可离线使用。
 
@@ -6,7 +6,7 @@ macOS 菜单栏听写工具。按一次麦克风键开始说话，识别文字�
 
 **适用设备：Apple 芯片 Mac，macOS 26.0 或更高版本。**
 
-1. 打开 [最新 Release](https://github.com/lijiaming0914-cmd/x-asr-dictation/releases/latest)，下载文件名以 `.dmg` 结尾的安装包。
+1. 打开 [最新 Release](https://github.com/LiShenxianz/live-dictation/releases/latest)，下载文件名以 `.dmg` 结尾的安装包。
 2. 打开 DMG，将 **X-ASR 听写** 拖到 **Applications（应用程序）**，然后从「应用程序」打开它。模型随 App 一起安装。
 3. 首次启动按提示在「系统设置 → 隐私与安全性 → 辅助功能」允许 **X-ASR 听写**。首次开麦时，允许麦克风访问。
 4. 点进输入框，按 MacBook 内置键盘上带麦克风图标的键开始说话，再按一次停止。外接键盘可使用 **Control + Option + D**，也可以从菜单栏「听写」启动。
