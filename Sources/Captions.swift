@@ -1,71 +1,167 @@
 import AppKit
 
-/// A recording light near the pointer. It never accepts focus or mouse events.
+private final class LightPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+private final class DragSurface: NSView {
+    var pressed: ((NSEvent) -> Void)?
+    var moved: (() -> Void)?
+    var released: (() -> Void)?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { pressed?(event) }
+    override func mouseDragged(with event: NSEvent) { moved?() }
+    override func mouseUp(with event: NSEvent) { released?() }
+    override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(point) ? self : nil }
+}
+
 final class MicrophoneLight {
-    private let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 28, height: 28),
-        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    private let dot = NSView(frame: NSRect(x: 8, y: 8, width: 12, height: 12))
+    private let side = IndicatorPlacement.side
+    private let panel: NSPanel
+    private let dot = NSView(frame:NSRect(x:5,y:5,width:8,height:8))
+    private var drag: (mouse: NSPoint, origin: NSPoint)?
+    private let fade: IndicatorFade
+    private var pendingHide: DispatchWorkItem?
+    private var pendingReveal: DispatchWorkItem?
+    private var firstHideTime = DispatchTime.now()
+    private var speaking = false
+    private(set) var listening = false
+    private var dragged = false
+    private let positionKey = "microphoneLightPinnedOrigin"
+    private var lastCaret: (spot: FocusFollowing.Spot, origin: CGPoint)?
+    private var pinned: NSPoint?
 
     init() {
+        panel = LightPanel(contentRect:NSRect(x:0,y:0,width:side,height:side),styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+        fade = IndicatorFade(panel: panel)
         panel.title = "听写麦克风"
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
-        panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        let ring = NSView(frame: NSRect(origin: .zero, size: panel.frame.size))
+        panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary,.transient]
+        if let saved = UserDefaults.standard.string(forKey:positionKey) { pinned = NSPointFromString(saved) }
+        let ring = DragSurface(frame:NSRect(origin:.zero,size:panel.frame.size))
+        ring.toolTip = "拖动固定位置，双击恢复跟随光标"
         ring.wantsLayer = true
-        ring.layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.91).cgColor
-        ring.layer?.cornerRadius = 14
+        ring.layer?.backgroundColor = NSColor(white:0.12,alpha:0.88).cgColor
+        ring.layer?.cornerRadius = side/2
         ring.layer?.borderWidth = 1
-        ring.layer?.borderColor = NSColor(white: 1, alpha: 0.4).cgColor
+        ring.layer?.borderColor = NSColor(white:1,alpha:0.45).cgColor
         dot.wantsLayer = true
-        dot.layer?.cornerRadius = 6
+        dot.layer?.backgroundColor = NSColor.systemGreen.cgColor
+        dot.layer?.cornerRadius = 4
         ring.addSubview(dot)
         panel.contentView = ring
-    }
-
-    private func indicatorPoint() -> NSPoint {
-        let pointer = NSEvent.mouseLocation
-        guard let spot = FocusFollowing.Spot.current(), let main = NSScreen.screens.first else { return pointer }
-        if let field = spot.field {
-            var range: CFTypeRef?, bounds: CFTypeRef?
-            if AXUIElementCopyAttributeValue(field,kAXSelectedTextRangeAttribute as CFString,&range) == .success,
-               let range, AXUIElementCopyParameterizedAttributeValue(field,kAXBoundsForRangeParameterizedAttribute as CFString,range,&bounds) == .success,
-               let bounds, CFGetTypeID(bounds) == AXValueGetTypeID() {
-                var caret = CGRect.zero
-                if AXValueGetValue(bounds as! AXValue,.cgRect,&caret), caret.height > 0, caret.height < 150 {
-                    return NSPoint(x:caret.maxX,y:main.frame.maxY-caret.maxY)
-                }
+        ring.pressed = { [weak self] event in
+            guard let self else { return }
+            if event.clickCount == 2 {
+                self.drag = nil
+                self.pinned = nil
+                UserDefaults.standard.removeObject(forKey:self.positionKey)
+                self.reposition(FocusFollowing.Spot.current())
+            } else {
+                self.dragged = false
+                self.drag = (NSEvent.mouseLocation,self.panel.frame.origin)
             }
         }
-        guard let window=spot.window else { return pointer }
-        var origin: CFTypeRef?, size: CFTypeRef?, point=CGPoint.zero, extent=CGSize.zero
-        guard AXUIElementCopyAttributeValue(window,kAXPositionAttribute as CFString,&origin) == .success,
-              AXUIElementCopyAttributeValue(window,kAXSizeAttribute as CFString,&size) == .success,
-              let origin, let size, CFGetTypeID(origin)==AXValueGetTypeID(), CFGetTypeID(size)==AXValueGetTypeID(),
-              AXValueGetValue(origin as! AXValue,.cgPoint,&point), AXValueGetValue(size as! AXValue,.cgSize,&extent)
-        else { return pointer }
-        let frame=CGRect(x:point.x,y:main.frame.maxY-point.y-extent.height,width:extent.width,height:extent.height)
-        return frame.contains(pointer) ? pointer : NSPoint(x:frame.midX,y:frame.minY+55)
+        ring.moved = { [weak self] in
+            guard let self, let drag = self.drag else { return }
+            let mouse = NSEvent.mouseLocation
+            guard hypot(mouse.x-drag.mouse.x,mouse.y-drag.mouse.y) > 2,
+                  let screen = NSScreen.screens.first(where:{$0.frame.contains(mouse)}) else { return }
+            self.dragged = true
+            let point = NSPoint(x:drag.origin.x+mouse.x-drag.mouse.x,y:drag.origin.y+mouse.y-drag.mouse.y)
+            self.panel.setFrameOrigin(IndicatorPlacement.clamp(point,to:screen.visibleFrame))
+        }
+        ring.released = { [weak self] in
+            guard let self, self.drag != nil else { return }
+            if self.dragged {
+                self.pinned = self.panel.frame.origin
+                UserDefaults.standard.set(NSStringFromPoint(self.panel.frame.origin),forKey:self.positionKey)
+            }
+            self.drag = nil
+            self.reposition(FocusFollowing.Spot.current())
+        }
     }
 
-    func show() {
-        let point = indicatorPoint()
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) ?? NSScreen.main else { return }
-        let b = screen.visibleFrame
-        let size = panel.frame.size
-        panel.setFrameOrigin(NSPoint(x: min(max(b.minX, point.x + 12), b.maxX - size.width),
-            y: max(b.minY, min(point.y - size.height - 8, b.maxY - size.height))))
-        signal(false)
-        panel.orderFrontRegardless()
+    private func reposition(_ spot: FocusFollowing.Spot?, immediately: Bool = false) {
+        guard drag == nil else { return }
+        guard listening && !speaking else { fade.hide(); return }
+        let origin: NSPoint?
+        if let pinned, let screen = NSScreen.screens.first(where:{$0.frame.contains(pinned)}) {
+            origin = IndicatorPlacement.clamp(pinned,to:screen.visibleFrame)
+        } else if let spot, let point = IndicatorPlacement.origin(for: spot) {
+            lastCaret = (spot, point)
+            origin = point
+        } else if let lastCaret, let spot, spot.field != nil, spot == lastCaret.spot,
+                  NSScreen.screens.contains(where: { $0.visibleFrame.contains(lastCaret.origin) }) {
+            origin = lastCaret.origin
+        } else {
+            lastCaret = nil
+            origin = nil
+        }
+        guard let origin else {
+            fade.hide()
+            return
+        }
+        fade.display(at: origin, immediately: immediately)
+    }
+    func follow(_ spot: FocusFollowing.Spot?) { if listening { reposition(spot) } }
+    func show(at spot: FocusFollowing.Spot? = FocusFollowing.Spot.current(), immediately: Bool = true) {
+        cancelSpeechTimers()
+        speaking = false
+        listening = true
+        firstHideTime = .now() + 0.9
+        reposition(spot, immediately: immediately)
     }
 
-    func signal(_ audible: Bool) {
-        dot.layer?.backgroundColor = (audible ? NSColor.systemGreen : NSColor(white: 0.82, alpha: 1)).cgColor
+    func inputAdvanced(typing: Bool = false) {
+        guard listening else { return }
+        if typing {
+            pendingHide?.cancel()
+            pendingHide = nil
+            speaking = true
+            if drag == nil { fade.hide() }
+        } else if !speaking && pendingHide == nil {
+            // Leave the opening cue visible even if recognition delivers text immediately.
+            let hide = DispatchWorkItem { [weak self] in
+                guard let self, self.listening else { return }
+                self.pendingHide = nil
+                self.speaking = true
+                if self.drag == nil { self.fade.hide() }
+            }
+            pendingHide = hide
+            DispatchQueue.main.asyncAfter(deadline: firstHideTime, execute: hide)
+        }
+        pendingReveal?.cancel()
+        let reveal = DispatchWorkItem { [weak self] in
+            guard let self, self.listening else { return }
+            self.pendingReveal = nil
+            self.pendingHide?.cancel()
+            self.pendingHide = nil
+            self.speaking = false
+            self.reposition(FocusFollowing.Spot.current())
+        }
+        pendingReveal = reveal
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: reveal)
     }
 
-    func hide() { panel.orderOut(nil) }
+    private func cancelSpeechTimers() {
+        pendingHide?.cancel()
+        pendingHide = nil
+        pendingReveal?.cancel()
+        pendingReveal = nil
+    }
+
+    func hide() {
+        cancelSpeechTimers()
+        listening = false
+        lastCaret = nil
+        speaking = false
+        drag = nil
+        fade.hide()
+    }
 }

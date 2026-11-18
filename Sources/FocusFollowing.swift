@@ -17,11 +17,23 @@ final class FocusFollowing {
                   let v,CFGetTypeID(v)==AXUIElementGetTypeID() else { return nil }
             return (v as! AXUIElement)
         }
+        private static var accessibilityPID: pid_t?
+        private static var lastAccessibilityAttempt = Date.distantPast
         static func current() -> Self? {
             guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
             let a = AXUIElementCreateApplication(front.processIdentifier)
-            return Self(pid:front.processIdentifier, window:element(a,kAXFocusedWindowAttribute),
-                        field:element(a,kAXFocusedUIElementAttribute))
+            var field = element(a, kAXFocusedUIElementAttribute)
+            if accessibilityPID != front.processIdentifier || (field == nil && Date().timeIntervalSince(lastAccessibilityAttempt) >= 1) {
+                lastAccessibilityAttempt = Date()
+                accessibilityPID = front.processIdentifier
+                _ = AXUIElementSetAttributeValue(a, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+                field = element(a, kAXFocusedUIElementAttribute)
+            }
+            if field == nil, let focused = element(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute) {
+                var owner: pid_t = 0
+                if AXUIElementGetPid(focused, &owner) == .success, owner == front.processIdentifier { field = focused }
+            }
+            return Self(pid:front.processIdentifier, window:element(a,kAXFocusedWindowAttribute), field:field)
         }
         var editable: Bool {
             guard let field else { return false }
@@ -54,6 +66,7 @@ final class FocusFollowing {
     }
     private var last = Spot.current()
     private var pending = false
+    private var editing = false
     private var nextCheck = Date.distantPast
     private var blocked = false
     private var mouseHeld = false
@@ -63,21 +76,30 @@ final class FocusFollowing {
     private let pause: () -> Void
     private let resume: () -> Void
 
-    init(pause: @escaping () -> Void,resume: @escaping () -> Void) {
+    var typed: (() -> Void)?
+    var inputChanged: ((Spot?) -> Void)?
+    var updateIndicator: ((Spot?) -> Void)?
+    private let beginEdit: () -> Void
+    private let finishEdit: () -> Void
+
+    init(pause: @escaping () -> Void, resume: @escaping () -> Void,
+         beginEdit: @escaping () -> Void, finishEdit: @escaping () -> Void) {
+        self.beginEdit = beginEdit
+        self.finishEdit = finishEdit
         self.pause = pause; self.resume = resume
         monitor = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.keyDown]) { [weak self] e in
             guard let self else { return }
             switch e.type {
             case .leftMouseDown,.rightMouseDown:
-                self.mouseHeld = true; self.clicked = false; self.blocked = false; self.interrupt()
+                self.mouseHeld = true; self.clicked = false; self.blocked = false; self.observeEdit()
             case .leftMouseUp,.rightMouseUp:
                 self.mouseHeld = false; self.clicked = e.type == .leftMouseUp
                 self.nextCheck = Date().addingTimeInterval(0.16)
             case .keyDown:
                 guard e.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid()),
-                      e.keyCode != kVK_F20,
-                      !(e.keyCode == kVK_ANSI_D && e.modifierFlags.contains([.control,.option])) else { return }
-                self.clicked = false; self.blocked = false; self.interrupt()
+                      !ShortcutBinding.shared.matches(e) else { return }
+                if Self.isTyping(e) { self.typed?() }
+                self.clicked = false; self.blocked = false; self.observeEdit()
             default: break
             }
         }
@@ -86,7 +108,20 @@ final class FocusFollowing {
         timer = clock
     }
 
+    private static func isTyping(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection([.command, .control]).isEmpty else { return false }
+        if [kVK_Delete, kVK_ForwardDelete, kVK_Return, kVK_ANSI_KeypadEnter].contains(Int(event.keyCode)) { return true }
+        guard let characters = event.charactersIgnoringModifiers else { return false }
+        return characters.unicodeScalars.contains { $0.value >= 32 && !(0xF700...0xF8FF).contains($0.value) }
+    }
+
+    private func observeEdit() {
+        nextCheck = Date().addingTimeInterval(0.12)
+        if !pending && !editing { editing = true; beginEdit() }
+    }
+
     private func interrupt() {
+        editing = false
         nextCheck = Date().addingTimeInterval(0.16)
         if !pending { pending = true; pause() }
     }
@@ -98,10 +133,23 @@ final class FocusFollowing {
 
     private func poll() {
         let now = Spot.current()
-        if now != last { last = now; blocked = false; interrupt() }
-        guard pending, !blocked, !mouseHeld, Date() >= nextCheck, let now,
-              now.editable || (clicked && now.opaque && Spot.textPointer()) else { return }
-        pending = false; clicked = false; resume()
+        if now != last {
+            last = now
+            blocked = false
+            interrupt()
+            inputChanged?(now)
+        } else { updateIndicator?(now) }
+        guard !blocked, !mouseHeld, Date() >= nextCheck, let now else { return }
+        if editing && !pending {
+            editing = false
+            if now.editable || (now.opaque && (!clicked || Spot.textPointer())) {
+                finishEdit()
+            } else {
+                interrupt()
+            }
+        } else if pending && now.permitsInitialInput {
+            pending = false; clicked = false; resume()
+        }
     }
     func stop() {
         timer?.invalidate(); timer = nil

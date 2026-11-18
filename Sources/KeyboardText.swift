@@ -13,8 +13,7 @@ final class KeyboardText {
         self.pid = pid
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]) { [weak self] e in
             guard let self, e.cgEvent?.getIntegerValueField(.eventSourceUserData) != self.tag else { return }
-            if e.type == .keyDown && (e.keyCode == kVK_F20 ||
-                (e.keyCode == kVK_ANSI_D && e.modifierFlags.contains([.control,.option]))) { return }
+            if e.type == .keyDown && ShortcutBinding.shared.matches(e) { return }
             self.interrupted = true
         }
         activation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in

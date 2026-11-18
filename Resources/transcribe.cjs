@@ -16,7 +16,8 @@ const recognizer = new sherpa.OnlineRecognizer({
   decodingMethod: 'greedy_search', enableEndpoint: 1,
   rule1MinTrailingSilence: 2.4, rule2MinTrailingSilence: 1.2, rule3MinUtteranceLength: 20,
 });
-const stream = recognizer.createStream();
+let stream = recognizer.createStream();
+let epoch = 0;
 const pieces = [];
 function decode() {
   while (recognizer.isReady(stream)) recognizer.decode(stream);
@@ -34,7 +35,7 @@ function feed(samples, live) {
       const current = text();
       if (current !== previous) {
         previous = current;
-        console.log(JSON.stringify({partial: current}));
+        console.log(JSON.stringify({partial: current, epoch}));
       }
     }
     if (recognizer.isEndpoint(stream)) {
@@ -50,13 +51,31 @@ function finish() {
   decode();
   return text();
 }
-if (process.argv[2] === '--live') {
+function pcmSamples(bytes) {
+  const samples = new Float32Array(Math.floor(bytes.length / 2));
+  for (let i = 0; i < samples.length; i++) samples[i] = bytes.readInt16LE(i * 2) / 32768;
+  return samples;
+}
+if (process.argv[2] === '--session') {
+  const lines = require('node:readline').createInterface({input: process.stdin, crlfDelay: Infinity});
+  lines.on('line', line => {
+    const separator = line.indexOf(' ');
+    const id = Number(line.slice(0, separator));
+    if (id !== epoch) {
+      epoch = id;
+      stream = recognizer.createStream();
+      previous = '';
+      pieces.length = 0;
+    }
+    feed(pcmSamples(Buffer.from(line.slice(separator + 1), 'base64')), true);
+  });
+  lines.on('close', () => console.log(JSON.stringify({final: finish(), epoch})));
+} else if (process.argv[2] === '--live') {
   let remainder = Buffer.alloc(0);
   process.stdin.on('data', chunk => {
     const bytes = remainder.length ? Buffer.concat([remainder, chunk]) : chunk;
     const count = Math.floor(bytes.length / 2);
-    const samples = new Float32Array(count);
-    for (let i = 0; i < count; i++) samples[i] = bytes.readInt16LE(i * 2) / 32768;
+    const samples = pcmSamples(bytes);
     remainder = bytes.subarray(count * 2);
     feed(samples, true);
   });

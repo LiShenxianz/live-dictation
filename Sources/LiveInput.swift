@@ -12,11 +12,14 @@ final class LiveInput: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let onLevel: (Bool) -> Void
     private let onEnd: (Result<String, Error>) -> Void
     private var accepting = true
+    private var epoch = 0  // Main thread: expected recognition segment.
+    private var audioEpoch = 0  // Capture queue: segment attached to audio packets.
     private var lastSignal = Date.distantPast
     private var displayedSignal: Bool?
     private var readError: String?
     private var runtimeObserver: NSObjectProtocol?
     private(set) var name = ""
+    var isRecording: Bool { capture.isRunning }
     private static func error(_ text: String) -> NSError {
         NSError(domain: "LiveInput", code: 1, userInfo: [NSLocalizedDescriptionKey: text])
     }
@@ -40,7 +43,7 @@ final class LiveInput: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         guard capture.canAddOutput(output) else { throw Self.error("无法读取麦克风声音。") }
         capture.addOutput(output)
         worker.executableURL = node
-        worker.arguments = [script.path, "--live"]
+        worker.arguments = [script.path, "--session"]
         worker.standardInput = input
         worker.standardOutput = messages
         try worker.run()
@@ -68,10 +71,12 @@ final class LiveInput: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             pending.append(bytes)
             while let newline = pending.firstIndex(of: 10) {
                 let data = pending[..<newline]
-                let msg = (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
+                let msg = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
                 pending.removeSubrange(...newline)
-                if let text = msg?["partial"] { DispatchQueue.main.async { self.onUpdate(text) } }
-                if let text = msg?["final"] { final = text }
+                if let text = msg?["partial"] as? String, let id = msg?["epoch"] as? Int {
+                    DispatchQueue.main.async { if self.epoch == id { self.onUpdate(text) } }
+                }
+                if let text = msg?["final"] as? String { final = text }
             }
         }
         worker.waitUntilExit()
@@ -106,7 +111,22 @@ final class LiveInput: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             displayedSignal = audible
             DispatchQueue.main.async { self.onLevel(audible) }
         }
-        do { try input.fileHandleForWriting.write(contentsOf: data) }
+        sendPacket(data)
+    }
+
+    func resetSegment() {
+        epoch += 1
+        let id = epoch
+        samples.async {
+            self.audioEpoch = id
+            self.sendPacket(Data())
+        }
+    }
+
+    private func sendPacket(_ data: Data) {
+        guard accepting else { return }
+        let packet = "\(audioEpoch) " + data.base64EncodedString() + "\n"
+        do { try input.fileHandleForWriting.write(contentsOf: Data(packet.utf8)) }
         catch { accepting = false }
     }
 

@@ -19,64 +19,76 @@ func transcribe(_ url: URL) throws -> String {
     return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-final class DictationApp: NSObject, NSApplicationDelegate {
+final class DictationApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let brand = NSMenuItem(title: "神仙语音转录", action: nil, keyEquivalent: "")
+    private lazy var header = MenuStatusHeader(title: brand.title, icon: NSApp.applicationIconImage)
     let action = NSMenuItem(title: "开始听写（⌃⌥D）", action: #selector(toggle), keyEquivalent: "")
-    let info = NSMenuItem(title: "X-ASR · 本机识别", action: nil, keyEquivalent: "")
-    var hotkey: EventHotKeyRef?
-    private let microphoneKey = MicrophoneKey()
-    private var microphoneHotkey: EventHotKeyRef?
+    private let shortcuts = ShortcutBinding.shared
+    private var shortcutEditor: ShortcutEditor?
+    private var hotkeysAvailable = false
+    private let settings = NSMenuItem(title: "自定义快捷键…", action: #selector(changeShortcut), keyEquivalent: "")
+    private let access = NSMenuItem()
+    private var status = "听写"
     private let light = MicrophoneLight()
+    private let cues = RecordingCues()
     private var live: LiveInput?
     private var following: FocusFollowing?
     private var generation = 0
     var busy = false
     private var destination: TextDestination?
-    var shortcutTitle = "开始听写（⌃⌥D）"
+    private var pendingText: String?
+    private func updateAction(recording: Bool = false) {
+        action.title = recording ? "结束听写" : "开始听写"
+        let keys = [shortcuts.hasMic ? "麦克风键" : nil, shortcuts.hasKeyboard ? shortcuts.choice.title : nil]
+        action.subtitle = keys.compactMap { $0 }.joined(separator: "  /  ")
+        action.image = NSImage(systemSymbolName: recording ? "stop.circle" : "mic", accessibilityDescription: nil)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
+        menu.minimumWidth = 220
+        brand.view = header
         menu.addItem(brand)
         menu.addItem(.separator())
         item.autosaveName = "LiveDictation"
         item.isVisible = true
-        let image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "神仙语音转录")
+        let image = Bundle.main.url(forResource: "MenuMicrophone", withExtension: "svg")
+            .flatMap { NSImage(contentsOf: $0) }
+            ?? NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "神仙语音转录")
+        image?.size = NSSize(width: 18, height: 18)
         image?.isTemplate = true
         item.button?.image = image
         item.button?.setAccessibilityLabel("神仙语音转录")
         action.target = self
         menu.addItem(action)
-        menu.addItem(info)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "授权自动输入…", action: #selector(requestPasteAccess), keyEquivalent: "").target = self
+        settings.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
+        settings.target = self
+        menu.addItem(settings)
+        menu.delegate = self
+        menu.addItem(access)
+        access.target = self
+        menu.addItem(.separator())
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         item.menu = menu
         setStatus("听写")
-        item.button?.toolTip = "神仙语音转录 · Control + Option + D"
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let installed = InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
-            guard let context else { return OSStatus(eventNotHandledErr) }
-            Unmanaged<DictationApp>.fromOpaque(context).takeUnretainedValue().toggle()
+        hotkeysAvailable = InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+            guard let event, let context else { return OSStatus(eventNotHandledErr) }
+            var id = EventHotKeyID()
+            guard GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                    nil, MemoryLayout<EventHotKeyID>.size, nil, &id) == noErr,
+                  id.signature == ShortcutBinding.signature else { return OSStatus(eventNotHandledErr) }
+            let app = Unmanaged<DictationApp>.fromOpaque(context).takeUnretainedValue()
+            if let editor = app.shortcutEditor {
+                if id.id == app.shortcuts.keyboardID { editor.selectCurrent() }
+            } else if id.id == app.shortcuts.keyboardID || id.id == ShortcutBinding.micID { app.toggle() }
             return noErr
-        }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), nil)
-        let key = EventHotKeyID(signature: 0x58415352, id: 1)
-        let registered = RegisterEventHotKey(UInt32(kVK_ANSI_D), UInt32(controlKey | optionKey), key, GetApplicationEventTarget(), 0, &hotkey)
-        let microphoneID = EventHotKeyID(signature: 0x58415352, id: 2)
-        let microphoneRegistered = RegisterEventHotKey(UInt32(kVK_F20), 0, microphoneID, GetApplicationEventTarget(), 0, &microphoneHotkey)
-        if installed == noErr && microphoneRegistered == noErr && microphoneKey.install() {
-            shortcutTitle = "开始听写（麦克风键）"
-            item.button?.toolTip = "神仙语音转录 · 按麦克风键开始或结束"
-        } else {
-            if let microphoneHotkey { UnregisterEventHotKey(microphoneHotkey) }
-            if installed == noErr && registered == noErr {
-                info.title = "麦克风键绑定失败，可用 ⌃⌥D"
-            } else {
-                shortcutTitle = "开始听写"
-                info.title = "快捷键不可用，请从此菜单启动"
-            }
-        }
-        action.title = shortcutTitle
+        }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), nil) == noErr
+        if hotkeysAvailable { shortcuts.start() }
+        refreshAccess()
+        updateAction()
         if !AXIsProcessTrusted() && !UserDefaults.standard.bool(forKey: "offeredTextInsertionAccess") {
             UserDefaults.standard.set(true, forKey: "offeredTextInsertionAccess")
             requestPasteAccess()
@@ -84,14 +96,61 @@ final class DictationApp: NSObject, NSApplicationDelegate {
     }
 
     private func setStatus(_ status: String) {
-        brand.title = status == "听写" ? "神仙语音转录" : "神仙语音转录 · " + status
-        item.button?.toolTip = brand.title
+        self.status = status
+        refreshAccess()
+        item.button?.contentTintColor = ["🟢 听写中", "● 录音中"].contains(status) ? .systemGreen : nil
         item.button?.setAccessibilityValue(status)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         item.menu?.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
         return false
+    }
+
+    @objc private func changeShortcut() {
+        guard shortcutEditor == nil else { return }
+        guard hotkeysAvailable else { alert("快捷键服务未启动，请重新打开 App。"); return }
+        let editor = ShortcutEditor(shortcuts)
+        shortcutEditor = editor
+        editor.run()
+        shortcutEditor = nil
+        if following == nil && live == nil { updateAction() }
+        refreshAccess()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        refreshAccess()
+    }
+
+    private func refreshAccess() {
+        let granted = AXIsProcessTrusted()
+        access.title = granted ? "自动输入：已授权" : "自动输入：未授权"
+        access.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(paletteColors: [granted ? .systemGreen : .systemRed]))
+        access.action = #selector(openAccessSettings)
+        let subtitle: String
+        if status != "听写" {
+            subtitle = status
+        } else if !granted {
+            subtitle = "等待授权 · 自动输入"
+        } else {
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:
+                subtitle = "就绪"
+            case .notDetermined: subtitle = "首次开麦时需授权"
+            default: subtitle = "麦克风未授权"
+            }
+        }
+        brand.subtitle = subtitle
+        header.update(subtitle)
+        item.button?.toolTip = brand.title + " · " + subtitle
+    }
+
+    @objc private func openAccessSettings() {
+        if !AXIsProcessTrusted() { requestPasteAccess() }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc func requestPasteAccess() {
@@ -113,16 +172,18 @@ final class DictationApp: NSObject, NSApplicationDelegate {
             following = nil
             if live == nil {
                 setStatus("听写")
-                action.title = shortcutTitle
+                updateAction()
                 light.hide()
+                cues.end()
                 return
             }
         }
         if let live {
             busy = true
             setStatus("正在完成…")
-            light.hide()
             live.finish()
+            light.hide()
+            cues.end()
             return
         }
         busy = true
@@ -135,9 +196,25 @@ final class DictationApp: NSObject, NSApplicationDelegate {
                     return
                 }
                 self.following = FocusFollowing(pause: { [weak self] in self?.pauseForFocus() },
-                    resume: { [weak self] in self?.resumeAtFocus() })
+                    resume: { [weak self] in self?.resumeAtFocus() },
+                    beginEdit: { [weak self] in
+                        self?.destination = nil
+                        self?.pendingText = nil
+                        self?.live?.resetSegment()
+                    }, finishEdit: { [weak self] in
+                        guard let self else { return }
+                        self.destination = TextDestination()
+                        if let text = self.pendingText { self.writePartial(text) }
+                        self.pendingText = nil
+                    })
+                self.following?.typed = { [weak self] in self?.light.inputAdvanced(typing: true) }
+                self.following?.inputChanged = { [weak self] spot in
+                    if let spot, spot.permitsInitialInput { self?.light.show(at: spot, immediately: false) }
+                    else { self?.light.hide() }
+                }
+                self.following?.updateIndicator = { [weak self] in self?.light.follow($0) }
                 if FocusFollowing.Spot.current()?.permitsInitialInput == true {
-                    self.resumeAtFocus()
+                    self.resumeAtFocus(manual: true)
                 } else {
                     self.following?.waitForInput()
                 }
@@ -147,19 +224,26 @@ final class DictationApp: NSObject, NSApplicationDelegate {
 
     private func pauseForFocus() {
         generation += 1
-        light.hide()
+        pendingText = nil
         destination = nil
         let old = live
         live = nil
         old?.finish()
+        light.hide()
         setStatus("等待输入框")
+        updateAction(recording: true)
     }
 
-    private func resumeAtFocus() {
+    private func resumeAtFocus(manual: Bool = false) {
         guard following != nil, live == nil else { return }
+        if !light.listening { light.show(immediately: manual) }
         destination = TextDestination()
-        light.show()
         startListening()
+    }
+
+    private func writePartial(_ text: String) {
+        guard let destination else { pendingText = text; return }
+        if !destination.update(text) && !busy { following?.waitForAnotherTarget() }
     }
 
     private func startListening() {
@@ -167,47 +251,46 @@ final class DictationApp: NSObject, NSApplicationDelegate {
         let current = generation
         let session = LiveInput(update: { [weak self] text in
             guard let self, self.generation == current else { return }
-            if self.destination?.update(text) != true, !self.busy {
-                self.following?.waitForAnotherTarget()
-            }
+            if !self.busy && !text.isEmpty { self.light.inputAdvanced() }
+            self.writePartial(text)
         }, level: { [weak self] audible in
             guard let self, self.generation == current, !self.busy, self.live != nil else { return }
-            self.light.signal(audible)
             self.setStatus(audible ? "🟢 听写中" : "● 录音中")
         }, end: { [weak self] result in
             guard let self, self.generation == current else { return }
             self.following?.stop()
             self.following = nil
             self.light.hide()
+            self.cues.end()
             self.live = nil
             self.busy = false
-            self.action.title = self.shortcutTitle
+            self.updateAction()
             self.setStatus("听写")
             switch result {
             case .success(let text) where text.isEmpty:
                 self.destination?.update("")
-                self.info.title = "没有识别到语音"
             case .success(let text):
                 let outcome = self.destination?.insert(text) ?? .unavailable
                 if let message = outcome.message {
-                    self.setStatus("已复制 · ⌘V")
-                    self.info.title = message
+                    self.item.button?.toolTip = message
                     if outcome == .needsAccess { self.requestPasteAccess() }
                     return
                 }
-                self.info.title = outcome == .inserted ? "已写入当前输入框" : "已向当前输入框发送粘贴"
             case .failure(let error): self.alert(error.localizedDescription)
             }
         })
         do {
             live = session
             try session.start(node: nodeURL, script: Bundle.main.url(forResource: "transcribe", withExtension: "cjs")!)
+            guard session.isRecording else { return }
+            cues.begin()
             setStatus("● 录音中")
-            action.title = "结束并输入文字"
+            updateAction(recording: true)
         } catch {
             following?.stop()
             following = nil
             light.hide()
+            cues.end()
             live = nil
             alert(error.localizedDescription)
         }
@@ -215,7 +298,7 @@ final class DictationApp: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         following?.stop()
-        microphoneKey.remove()
+        shortcuts.stop()
         live?.finish()
     }
 }

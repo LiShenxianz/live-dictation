@@ -41,7 +41,7 @@ done
 tar -xjf "$cache/$model.tar.bz2" -C "$resources/model" --strip-components 1 \
     "$model/encoder.int8.onnx" "$model/decoder.onnx" "$model/joiner.int8.onnx" "$model/tokens.txt" "$model/README.md"
 cp Resources/Info.plist "$app/Contents/Info.plist"
-cp Resources/transcribe.cjs "$resources/"
+cp Resources/transcribe.cjs Resources/AppIcon.icns Resources/MenuMicrophone.svg "$resources/"
 cp -R Notices/. "$resources/Notices/"
 xcrun swiftc -O -target arm64-apple-macos26.0 Sources/*.swift -o "$app/Contents/MacOS/Dictation"
 codesign --force --sign - "$app"
